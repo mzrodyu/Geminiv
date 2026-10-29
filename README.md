@@ -104,6 +104,40 @@ docker compose up -d
 
 ---
 
+## Linux 一键部署（Debian 11/12 · Ubuntu 20.04+）
+
+### 方式 A：Docker 一行拉起（镜像已由 GHCR CI 构建，公开可拉）
+```bash
+mkdir -p /opt/geminiv/data
+docker run -d --name geminiv --restart unless-stopped \
+  -p 7860:7860 \
+  -v /opt/geminiv/data:/app/data \
+  -e STATE_DIR=/app/data \
+  ghcr.io/mzrodyu/geminiv:latest
+```
+
+### 方式 B：源码 + systemd（不用 Docker，推荐裸机 VPS）
+```bash
+curl -fsSL https://raw.githubusercontent.com/mzrodyu/Geminiv/main/deploy.sh -o /root/deploy.sh
+sudo bash /root/deploy.sh
+# 国内 pip 慢就加镜像源：
+# sudo PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple bash /root/deploy.sh
+```
+
+脚本流程：`apt` 装 `git/python3-venv` → `clone` 到 `/opt/geminiv` → 建 venv 装 `app/requirements.txt` → 写 `/etc/systemd/system/geminiv.service`（`STATE_DIR=/opt/geminiv/data`）→ 启动 + 健康检查。**可重复执行**，再跑一次就是更新代码并重启。
+
+两种方式装完都只需：浏览器打开 `http://<服务器IP>:7860` → 口令 `123456` → 走首次启动向导。记得放行安全组 / 防火墙的 TCP 7860。
+
+升级：
+```bash
+# 方式 A
+docker pull ghcr.io/mzrodyu/geminiv:latest && docker rm -f geminiv && docker run -d --name geminiv --restart unless-stopped -p 7860:7860 -v /opt/geminiv/data:/app/data -e STATE_DIR=/app/data ghcr.io/mzrodyu/geminiv:latest
+# 方式 B
+sudo bash /root/deploy.sh
+```
+
+---
+
 ## 环境变量说明
 
 以下环境变量**全部是可选基线**：只是首次启动时的初始值，控制台里都能热改并持久化（`STATE_DIR` 除外，它只决定状态文件位置）。
