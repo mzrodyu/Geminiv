@@ -236,9 +236,21 @@ python -m compileall app
 # 控制台 / 系统设置接口冒烟测试（临时 STATE_DIR，不动真实配置）
 python tests/smoke_console_system.py
 
+# 流式收尾 + 工具 Schema 加固测试（断头流补帧、异常转错误帧、Schema 净化等 34 项）
+python tests/smoke_stream_and_tools.py
+
 # 本地启动服务（不设任何环境变量也能起，登录后在前端配）
 cd app
 uvicorn main:app --host 0.0.0.0 --port 7860
 ```
 
 > 本地直接跑时 `web_state.json` 默认落在 `app/` 目录；想换位置就设 `STATE_DIR`。
+
+---
+
+## 4.x 兼容性加固（工具调用 / 流式收尾）
+
+- **流必定以 `finish_reason` + `data: [DONE]` 收尾**：上游断流、只返回思考、异常中断都会被兜成标准 SSE 帧；完全没产出时返回可读的 502 诊断，而不是让客户端对残留空串 `json.loads("")` 抛 `JSONDecodeError`。
+- **工具参数 Schema 自动净化**：`$schema` / `$defs` / `$ref` / `patternProperties` / `additionalProperties` / `prefixItems` / `const` / `if-then-else` 等 Gemini 不接受的关键字会被去掉，`$ref` 就地展开、`allOf` 合并、`const → enum`、`["string","null"] → nullable`。
+- **工具回放容错**：客户端回传的 `tool_calls.function.arguments` 为空串/缺字段时会归一成 `{}`，不再 400/500。
+- 开「出站参数调试日志」后，控制台会打印净化过的工具数量，便于确认是不是 Schema 问题。

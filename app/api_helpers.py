@@ -19,7 +19,11 @@ from message_processing import (
 import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
-from schema_validation import SchemaValidationError, validate_request_schemas
+from schema_validation import (
+    SchemaValidationError,
+    validate_request_schemas,
+    sanitize_tool_schema,
+)
 from logger import stats
 
 
@@ -357,27 +361,40 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     ]
 
     tools_list = []
-    if request.tools:
+    _tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+    if request.tools and not _tools_disabled:
         function_declarations = []
+        _dropped_schema_keys = 0
         for tool in request.tools:
-            if tool.get("type") == "function":
-                func_data = tool.get("function")
-                if func_data:
-                    declaration = {
-                        "name": func_data.get("name"),
-                        "description": func_data.get("description"),
-                    }
-                    parameters = func_data.get("parameters")
-                    if isinstance(parameters, dict) and "$schema" in parameters:
-                        parameters = parameters.copy()
-                        del parameters["$schema"]
-                    if parameters is not None:
-                        declaration["parameters"] = parameters
-                    declaration = {k: v for k, v in declaration.items() if v is not None}
-                    if declaration.get("name"):
-                        function_declarations.append(declaration)
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                continue
+            func_data = tool.get("function")
+            if not func_data:
+                continue
+            declaration = {
+                "name": func_data.get("name"),
+                "description": func_data.get("description"),
+            }
+            parameters = func_data.get("parameters")
+            if isinstance(parameters, dict):
+                # 必须净化成 Gemini 能吃的 OpenAPI 子集：$defs / $ref / patternProperties /
+                # if-then-else / prefixItems / const / additionalProperties 等一律会被 400 拒。
+                original = parameters
+                parameters = sanitize_tool_schema(parameters)
+                if parameters != original:
+                    _dropped_schema_keys += 1
+                if not parameters:
+                    parameters = {"type": "object"}
+            if parameters is not None:
+                declaration["parameters"] = parameters
+            declaration = {k: v for k, v in declaration.items() if v is not None}
+            if declaration.get("name"):
+                function_declarations.append(declaration)
         if function_declarations:
             tools_list.append({"function_declarations": function_declarations})
+            if _dropped_schema_keys and app_state.get_setting("debug_outbound", False):
+                print(f"🧰 [工具 Schema] 已把 {_dropped_schema_keys} 个工具的 JSON Schema 净化成 "
+                      f"Gemini 兼容子集（移除 $defs/$ref/patternProperties 等不支持关键字）。")
 
     settings = app_state.get_effective_settings(request.model)
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
@@ -624,6 +641,11 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 function_call=fake_fc,
                 thought_signature=call_dict.get("thought_signature"),
             )
+            try:
+                args_json = json.dumps(fake_fc.args, ensure_ascii=False) if fake_fc.args is not None else "{}"
+            except (TypeError, ValueError):
+                # 上游偶尔会给出不可序列化的 proto 片段，宁可退化成空对象也不能让整条流 500
+                args_json = "{}"
             tc = {
                 "index": tc_index,
                 "id": build_tool_call_id(
@@ -633,7 +655,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 "type": "function",
                 "function": {
                     "name": fake_fc.name,
-                    "arguments": json.dumps(fake_fc.args, ensure_ascii=False) if fake_fc.args is not None else "{}",
+                    "arguments": args_json,
                 },
             }
             extra = thought_signature_extra(call_dict.get("thought_signature"))
@@ -797,11 +819,19 @@ async def _chunk_openai_response_dict_for_sse(
                         await asyncio.sleep(0.01)
 
         for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):
+            if not isinstance(tool_call_item, dict):
+                continue
+            tc_func = tool_call_item.get("function") or {}
+            tc_id = tool_call_item.get("id") or f"call_{tc_item_idx}"
+            tc_name = tc_func.get("name") or "unknown"
+            tc_args = tc_func.get("arguments")
+            if not isinstance(tc_args, str) or not tc_args.strip():
+                tc_args = "{}"
             tool_delta = {
                 "index": tc_item_idx,
-                "id": tool_call_item["id"],
+                "id": tc_id,
                 "type": "function",
-                "function": {"name": tool_call_item["function"]["name"], "arguments": ""},
+                "function": {"name": tc_name, "arguments": ""},
             }
             if tool_call_item.get("extra_content") is not None:
                 tool_delta["extra_content"] = tool_call_item["extra_content"]
@@ -809,8 +839,8 @@ async def _chunk_openai_response_dict_for_sse(
             await asyncio.sleep(0.01)
             yield _sse({"tool_calls": [{
                 "index": tc_item_idx,
-                "id": tool_call_item["id"],
-                "function": {"arguments": tool_call_item["function"]["arguments"]},
+                "id": tc_id,
+                "function": {"arguments": tc_args},
             }]})
             await asyncio.sleep(0.01)
 
@@ -904,6 +934,84 @@ def _emit_credential_invalid_warning(target: dict, err_code: int, err_formatted:
         user_tip = "\n\n👉 【凭证更换提醒】Studio Cookie 登录态已失效或项目无权限，请及时到控制台「通道与凭证」页更新 Cookie 或切换通道！"
     print(warn_line)
     return user_tip
+
+
+# ============================================================
+# 流式收尾保护：任何分支都必须以「finish_reason 帧 + data: [DONE]」结束。
+# 否则客户端（尤其是自己写的 Python / Node SSE 解析器）会在迭代结束时拿到
+# StopIteration 并对残留空串做 json.loads("")，抛出
+#   json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+# 这正是「4a + 工具调用」场景下最常见的崩法。
+# ============================================================
+
+_STREAM_FINISH_RE = re.compile(r'"finish_reason"\s*:\s*(?!null)("[^"]*"|\w+)')
+
+
+def _make_stream_finish_chunk(model_name: str, finish_reason: str = "stop") -> str:
+    payload = {
+        "id": f"chatcmpl-finish-{int(time.time() * 1000)}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name or "unknown",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _frame_to_text(frame: Any) -> str:
+    if isinstance(frame, str):
+        return frame
+    if isinstance(frame, (bytes, bytearray)):
+        return bytes(frame).decode("utf-8", "replace")
+    return str(frame)
+
+
+async def _terminate_stream_safely(inner, model_name: str):
+    """给任意流式生成器兜底：异常转标准错误帧，结尾必补 finish_reason + [DONE]。"""
+    saw_done = False
+    saw_finish = False
+    saw_output = False
+    failed = False
+    try:
+        async for frame in inner:
+            text = _frame_to_text(frame)
+            if "data: [DONE]" in text:
+                saw_done = True
+            if _STREAM_FINISH_RE.search(text):
+                saw_finish = True
+            if ('"tool_calls"' in text
+                    or '"reasoning_content":' in text
+                    or ('"content":' in text and '"content": ""' not in text and '"content": null' not in text)):
+                saw_output = True
+            yield frame
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        failed = True
+        code, msg = extract_upstream_error(e)
+        print(f"❌ [流式收尾保护] 模型={model_name} | 生成过程中出现未处理异常（HTTP {code}）：{msg[:1200]}")
+        err_resp = create_openai_error_response(code, msg[:2000], "upstream_error")
+        yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
+    if failed or saw_done:
+        if not saw_done:
+            yield "data: [DONE]\n\n"
+        return
+    if not saw_finish:
+        if not saw_output:
+            # 一个字节都没产出就断流：给明确诊断，别让客户端自己拼空串报 JSONDecodeError
+            print(f"❌ [流式收尾保护] 模型={model_name} | 上游在产出任何内容前断流，已返回可读错误。")
+            err_resp = create_openai_error_response(
+                502,
+                f"模型 {model_name} 的上游流在产出任何内容前就断开了（没有 finish_reason，也没有 [DONE]），"
+                "通常是上游连接被中断、思考超时或凭证被限流。建议：重试一次 / 调低思考档位 / "
+                "在控制台「重试与退避」里调大重试次数。",
+                "upstream_error",
+            )
+            yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
+        else:
+            print(f"⚠️ [流式收尾保护] 模型={model_name} | 上游流未给出 finish_reason 就结束了，已自动补齐收尾帧。")
+            yield _make_stream_finish_chunk(model_name, "stop")
+    yield "data: [DONE]\n\n"
 
 
 async def execute_unified_completion(
@@ -1323,6 +1431,33 @@ async def execute_unified_completion(
                     cookie_iter = None
                     try:
                         cookie_resp = await cookie_upstream.execute_once(request_obj, fastapi_request)
+                        if not hasattr(cookie_resp, "body_iterator"):
+                            # Studio 通道这次没给流，而是直接回了 JSONResponse（鉴权/项目/参数错误）。
+                            # 旧实现会在 .body_iterator 上抛 AttributeError，客户端只看到一句无关异常。
+                            status = int(getattr(cookie_resp, "status_code", 0) or 0)
+                            raw_body = getattr(cookie_resp, "body", b"") or b""
+                            detail_msg = ""
+                            try:
+                                parsed_body = json.loads(raw_body.decode("utf-8", "replace")) if raw_body else {}
+                                if isinstance(parsed_body, dict):
+                                    err_obj = parsed_body.get("error")
+                                    if isinstance(err_obj, dict):
+                                        detail_msg = str(err_obj.get("message") or "")
+                                    elif isinstance(err_obj, str):
+                                        detail_msg = err_obj
+                            except Exception:
+                                parsed_body = {}
+                            detail_msg = detail_msg or (
+                                f"Studio 通道返回了非流式响应（HTTP {status or '未知'}），"
+                                "通常是 Cookie 失效 / Project ID 不可用 / 参数被拒。")
+                            real_code = status if 400 <= status <= 599 else 502
+                            print(f"❌ [Studio 非流式响应] 凭证=[{target['label']}] | 模型={request_obj.model} | "
+                                  f"HTTP {status} | {detail_msg[:1500]}")
+                            stats.add_error()
+                            err_resp = create_openai_error_response(real_code, detail_msg[:2000], "upstream_error")
+                            yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
                         cookie_iter = cookie_resp.body_iterator
                         async for chunk_item in cookie_iter:
                             chunk_str = chunk_item.decode("utf-8", errors="replace") if isinstance(chunk_item, bytes) else str(chunk_item)
@@ -1397,7 +1532,10 @@ async def execute_unified_completion(
                     yield "data: [DONE]\n\n"
                     return
 
-        return StreamingResponse(_unified_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            _terminate_stream_safely(_unified_stream_generator(), request_obj.model),
+            media_type="text/event-stream",
+        )
 
     # ============================================================
     # 分支二：非流式请求（支持多 Key 轮询与跨通道 Cookie 互备）

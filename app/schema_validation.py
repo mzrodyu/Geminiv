@@ -108,3 +108,121 @@ def validate_request_schemas(request: Any) -> None:
             raise SchemaValidationError("response_format.json_schema must be an object")
         schema = json_schema.get("schema")
         validate_json_schema(schema, label="response_format.json_schema.schema")
+
+
+# ============================================================
+# 工具 Schema 净化：把 OpenAI / Pydantic 风格的 JSON Schema 压成
+# Gemini function_declarations 能吃下的 OpenAPI Schema 子集。
+# 直接原样下发会触发 400 INVALID_ARGUMENT（Unknown name "$defs"/"$ref"/
+# "patternProperties"/"if"/"prefixItems"/"const" ...），这是工具调用最常见的坑。
+# ============================================================
+
+# Gemini 官方支持的字段（不在这张表里的键一律丢弃）
+_GEMINI_SCHEMA_KEYS = {
+    "type", "format", "description", "nullable", "enum", "items", "properties",
+    "required", "minItems", "maxItems", "minimum", "maximum", "minLength",
+    "maxLength", "pattern", "title", "default", "propertyOrdering", "anyOf",
+}
+
+_MAX_SANITIZE_DEPTH = 24
+
+
+def _resolve_local_ref(node: Any, root: Any) -> Any:
+    """把 "#/$defs/Foo" / "#/definitions/Foo" 这类本地引用就地展开。"""
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if not isinstance(ref, str):
+        return node
+    if not ref.startswith("#/"):
+        return {k: v for k, v in node.items() if k != "$ref"}
+    cursor = root
+    for seg in ref[2:].split("/"):
+        seg = seg.replace("~1", "/").replace("~0", "~")
+        if isinstance(cursor, dict) and seg in cursor:
+            cursor = cursor[seg]
+        else:
+            return {k: v for k, v in node.items() if k != "$ref"}
+    merged = dict(cursor) if isinstance(cursor, dict) else {}
+    # 同级的 description / default 等覆盖被引用定义上的同名字段
+    merged.update({k: v for k, v in node.items() if k != "$ref"})
+    return merged
+
+
+def sanitize_tool_schema(schema: Any, _root: Any = None, _depth: int = 0) -> dict:
+    """返回只含 Gemini 可接受字段的 schema（无法识别的关键字安全丢弃）。"""
+    if not isinstance(schema, dict):
+        return {}
+    if _depth > _MAX_SANITIZE_DEPTH:
+        return {}
+    root = _root if isinstance(_root, dict) else schema
+
+    node = _resolve_local_ref(schema, root)
+
+    # allOf：合并成一个对象；oneOf / anyOf：只保留非 null 分支
+    for combiner in ("allOf", "oneOf", "anyOf"):
+        branches = node.get(combiner)
+        if not isinstance(branches, list) or not branches:
+            continue
+        resolved = [_resolve_local_ref(b, root) for b in branches]
+        resolved = [b for b in resolved if isinstance(b, dict)]
+        non_null = [b for b in resolved if b.get("type") != "null"]
+        nullable = len(non_null) != len(resolved)
+        rest = {k: v for k, v in node.items() if k not in ("allOf", "oneOf", "anyOf")}
+        if combiner == "allOf":
+            merged: dict = {}
+            for branch in non_null:
+                merged.update(sanitize_tool_schema(branch, root, _depth + 1))
+            node = {**rest, **merged}
+        elif len(non_null) == 1:
+            node = {**sanitize_tool_schema(non_null[0], root, _depth + 1), **rest}
+        else:
+            node = {**rest, "anyOf": [sanitize_tool_schema(b, root, _depth + 1) for b in non_null]}
+        if nullable:
+            node["nullable"] = True
+
+    out: dict = {}
+    for key, value in node.items():
+        if key not in _GEMINI_SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            cleaned_props = {}
+            for name, child in value.items():
+                if isinstance(name, str):
+                    cleaned_props[name] = sanitize_tool_schema(child, root, _depth + 1)
+            out["properties"] = cleaned_props
+        elif key == "items":
+            if isinstance(value, list):
+                out["items"] = sanitize_tool_schema(value[0], root, _depth + 1) if value else {}
+            else:
+                out["items"] = sanitize_tool_schema(value, root, _depth + 1)
+        elif key == "anyOf" and isinstance(value, list):
+            out["anyOf"] = [sanitize_tool_schema(b, root, _depth + 1) for b in value if isinstance(b, dict)]
+        elif key == "required" and isinstance(value, list):
+            names = [n for n in value if isinstance(n, str)]
+            if names:
+                out["required"] = names
+        else:
+            out[key] = value
+
+    # 客户端常用的 const → enum（Gemini 只认 enum）
+    if "const" in node and "enum" not in out:
+        out["enum"] = [node["const"]]
+
+    raw_type = out.get("type")
+    if isinstance(raw_type, list):
+        non_null_types = [t for t in raw_type if t != "null"]
+        if len(non_null_types) != len(raw_type):
+            out["nullable"] = True
+        if len(non_null_types) == 1:
+            out["type"] = non_null_types[0]
+        elif non_null_types:
+            out["type"] = non_null_types
+        else:
+            out.pop("type", None)
+
+    # 有 properties 却没写 type 的对象，补上 type=object（Gemini 必需）
+    if out.get("properties") and "type" not in out and "anyOf" not in out:
+        out["type"] = "object"
+    return out
+

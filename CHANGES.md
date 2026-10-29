@@ -1,3 +1,26 @@
+## 2026-10-29 流式收尾保护 + Gemini 4.x 工具调用加固（修 JSONDecodeError / 工具 Schema 400）
+
+### 1. 流式收尾保护：不再让客户端拿到「断头流」
+- 线上症状：`json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0) <- builtins.StopIteration: 0`。根因是上游（尤其 4-argon 长思考 + 工具调用）在**没有 `finish_reason`、也没有 `data: [DONE]`** 的情况下结束，客户端迭代结束时对残留空串 `json.loads("")`。
+- `api_helpers._terminate_stream_safely()` 统一包住流式响应：
+  - 上游正常结束但缺 `finish_reason` → 自动补一帧 `finish_reason=stop`；
+  - 缺 `data: [DONE]` → 必补；
+  - 整个流一个字节都没产出 → 返回可读的 502 诊断帧（提示重试 / 调低思考档位 / 调大重试次数），而不是让客户端自己崩；
+  - 生成过程中抛任何未处理异常（`JSONDecodeError` / `StopIteration` / `KeyError` / `TypeError`…）→ 转成标准 OpenAI 错误帧 + `[DONE]`，不再泄漏 traceback。
+- Studio（Cookie）通道分支修正：`execute_once` 返回 `JSONResponse`（Cookie 失效 / 项目不可用）时不再走 `.body_iterator` 抛 `AttributeError`，改为解析错误体并直接下发错误帧 + `[DONE]`；流式分支结束后同样由收尾保护兜底。
+
+### 2. 工具调用：JSON Schema 净化（4.x 必踩的 400）
+- 客户端（Pydantic / strict OpenAI schema）常带 `$schema`、`$defs`、`$ref`、`patternProperties`、`additionalProperties`、`prefixItems`、`const`、`if/then/else`、`oneOf/allOf`…
+  Gemini 的 `function_declarations.parameters` **不接受**这些关键字，原样透传就会 400 INVALID_ARGUMENT。
+- 新增 `schema_validation.sanitize_tool_schema()`：本地 `$ref` 就地展开、`allOf` 合并、`oneOf/anyOf` 收敛（`{"type":"null"}` 分支转 `nullable`）、`const → enum`、`type: ["string","null"] → type+nullable`、对象缺 `type` 自动补 `object`，其余不支持的关键字全部安全丢弃。
+- `create_generation_config()` 改为净化后再下发（`debug_outbound` 开启时会打印净化数量）；`tool_choice="none"` 时不再下发 tools。
+
+### 3. 其它健壮性
+- 工具流式分片：空/缺失 `arguments` 归一为 `"{}"`，缺失 `id` 自动补 `call_N`，不可序列化的 proto 参数退化为 `{}`，避免整条流 500。
+- 新增 `tests/smoke_stream_and_tools.py`（34 项断言）：断头流补帧、异常转错误帧、空流诊断、Cookie 通道 JSON 响应、Schema 净化、空参工具回放。
+
+---
+
 ## 2026-10-29 前端一键配置：首次启动向导 + 系统设置页（彻底不碰环境变量）
 
 ### 1. 首次启动 3 步向导（app/main.py · DASHBOARD_HTML）
