@@ -1,3 +1,31 @@
+## 2026-10-29 前端一键配置：首次启动向导 + 系统设置页（彻底不碰环境变量）
+
+### 1. 首次启动 3 步向导（app/main.py · DASHBOARD_HTML）
+- 控制台新增 `#wizard` 弹窗向导，`setup_completed` 未标记时自动弹出（每个浏览器只自动弹一次，可「稍后再说」，也可在系统设置页随时重开）：
+  ① **访问口令**：可「⚡ 一键随机口令并保存」，也可手填两遍；默认口令 123456 未改时红字提醒。
+  ② **通道与凭证**：选主通道 + 多行粘贴 Express Key（自动分行保存并后台探测 Project ID）+ Cookie / Project ID。
+  ③ **完成**：展示 OpenAI 兼容地址 `origin + /v1`。
+- 登录页新增 `.firstrun` 提示条：首次启动未完成、或口令仍为默认 123456 时，直接在登录卡片里说明「登录后会自动弹向导 / 去系统设置改口令」。
+
+### 2. 新增「系统设置」标签页（第 5 个 tab）
+- **控制台访问口令（API_KEY）**：手动改 / ⚡ 一键生成并保存 / 先预览再保存；保存后旧会话全部失效、当前页面自动续期，新口令只显示一次并可一键复制。
+- **上游代理（PROXY_URL）**：支持 `http(s)://`、`socks5(h)://`、`socks4(a)://`；「测试连通性」用该代理请求 `https://www.google.com/generate_204` 并回传状态码与耗时；清空即直连。
+- **模型列表来源（MODELS_CONFIG_URL）**：改成自建 JSON 地址后「保存并刷新」立即重建缓存并回显模型数量；留空恢复官方默认。
+- **状态持久化与备份**：显示 `STATE_DIR` / `web_state.json` 实际路径与大小、当前主通道与凭证就绪状态，支持「下载配置备份」与「重开向导」。
+
+### 3. 后端：运行态可写的系统级配置（app/runtime_state.py、app/auth.py）
+- `AppState` 新增 `runtime` 覆盖层（`api_key` / `proxy_url` / `models_config_url`）与 `setup_completed` 标记，落盘 `web_state.json`（权限 0600），启动时 `apply_runtime_config()` 写回 `config` 模块。
+- 优先级：**控制台保存值 > 环境变量 > 代码默认值**；`PROXY_URL` / `MODELS_CONFIG_URL` 在各调用点都是属性读取，改完下一次请求立即生效。
+- `auth.py` 改为动态读取 `config.API_KEY`（原来是 `from config import API_KEY` 的导入期快照），并改用 `secrets.compare_digest`，因此前端改口令后 `/v1` 鉴权即时切换。
+- 新增接口：`GET /api/system`、`POST /api/system/api-key`、`POST /api/system/proxy`（+ `/proxy/test`）、`POST /api/system/models-source`、`POST /api/system/setup-complete`、`GET /api/system/state-backup`。
+
+### 4. 部署与测试
+- `docker-compose.yml`：除 `STATE_DIR` 外全部环境变量改为注释示例 —— 零配置起容器，登录后在控制台配完即可用。
+- 新增 `tests/smoke_console_system.py`：覆盖登录页提示、改口令（旧会话失效 / 旧口令拒登）、代理校验与保存、模型源切换、状态备份、`setup_completed`、以及 `/v1` 动态 Bearer 鉴权，共 29 项断言。
+- 页面细节：向导主通道改用 `.wiz-chan`（避免继承 `.chan-card` 的 0.78 透明度过淡）、弹窗卡片改为不透明 `var(--inp-bg)`、去掉整屏 `backdrop-filter`（部分浏览器截图/合成下会把整页糊掉）。
+
+---
+
 ## 2026-10-23 多账号轮询容灾、Key ↔ Cookie 跨通道互备与 500 智能重试体系
 
 ### 1. 多 Express Key 轮换与 Project ID 动态感知

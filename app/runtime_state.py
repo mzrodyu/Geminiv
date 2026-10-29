@@ -311,6 +311,70 @@ class AppState:
                     base[k] = ov[k]
         return base
 
+    # ---------- 系统级运行配置（前端「系统设置」页可热改，落盘持久化） ----------
+    # 这三项历史上只能通过环境变量 / 改代码配置；现在支持在前端改完立即生效。
+    # 语义：覆盖值为空字符串 = 回退到启动时的环境变量 / 代码默认值。
+
+    def get_runtime_config(self) -> dict:
+        """控制台里显式保存过的覆盖值（空字符串表示未覆盖）。"""
+        with self._lock:
+            rt = self._state.get("runtime")
+            rt = rt if isinstance(rt, dict) else {}
+            return {k: str(rt.get(k) or "") for k in _BASE_RUNTIME}
+
+    def get_effective_runtime_config(self) -> dict:
+        """最终生效值（控制台覆盖优先，其次环境变量 / 代码默认）。"""
+        override = self.get_runtime_config()
+        return {k: (override[k] or _BASE_RUNTIME[k] or "") for k in _BASE_RUNTIME}
+
+    def update_runtime_config(self, patch: dict) -> dict:
+        if not isinstance(patch, dict):
+            return self.get_runtime_config()
+        with self._lock:
+            rt = self._state.get("runtime")
+            rt = dict(rt) if isinstance(rt, dict) else {}
+            for k, v in patch.items():
+                if k in _BASE_RUNTIME:
+                    rt[k] = str(v or "").strip()
+            self._state["runtime"] = rt
+            self._save()
+            print(f"🧩 [状态管理器] 系统级运行配置已更新（{', '.join(k for k in patch if k in _BASE_RUNTIME)}）。")
+        self.apply_runtime_config()
+        return self.get_runtime_config()
+
+    def apply_runtime_config(self) -> dict:
+        """把控制台保存的覆盖值写回 config 模块（各调用点都是属性读取，立即生效）。"""
+        effective = self.get_effective_runtime_config()
+        app_config.API_KEY = effective["api_key"] or _BASE_RUNTIME["api_key"]
+        app_config.PROXY_URL = effective["proxy_url"] or _BASE_RUNTIME["proxy_url"]
+        app_config.MODELS_CONFIG_URL = effective["models_config_url"] or _BASE_RUNTIME["models_config_url"]
+        return effective
+
+    def is_setup_completed(self) -> bool:
+        with self._lock:
+            return bool(self._state.get("setup_completed", False))
+
+    def mark_setup_completed(self, completed: bool = True) -> None:
+        with self._lock:
+            self._state["setup_completed"] = bool(completed)
+            self._save()
+
+    def is_first_run(self) -> bool:
+        return not self.is_setup_completed()
+
+    def export_state(self) -> dict:
+        """完整状态快照（用于「下载配置备份」）。"""
+        with self._lock:
+            return copy.deepcopy(self._state)
+
+
+# 启动时的基线值（环境变量 / 代码默认），控制台覆盖被清空后回退到这里
+_BASE_RUNTIME = {
+    "api_key": app_config.API_KEY,
+    "proxy_url": app_config.PROXY_URL,
+    "models_config_url": app_config.MODELS_CONFIG_URL,
+}
+
 
 # 单例模式导出
 app_state = AppState()

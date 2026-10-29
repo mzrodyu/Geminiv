@@ -7,20 +7,23 @@ services:
     ports:
       - "8050:7860"
     volumes:
-      # S-3：不挂卷的话，docker compose up --force-recreate 或升级镜像后
+      # 不挂卷的话，docker compose up --force-recreate 或升级镜像后
       # web_state.json 会丢失，Cookie 与全部控制台设置都要重配。
       - ./data:/app/data
     environment:
-      # 状态文件目录（web_state.json 落在这里）
+      # 唯一建议保留的环境变量：状态文件目录（web_state.json 落在这里）。
       - STATE_DIR=/app/data
-      # Protect this adapter's OpenAI-compatible API.
-      # ⚠️ 必须改成强口令：它既是本代理的 API Key，也是控制台登录密码
-      - API_KEY=change-me-please
-      # Required: one or more Gemini Express Mode API keys, separated by commas.
-      - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
-      # Optional: set true to rotate Express keys in order instead of random selection.
-      - ROUNDROBIN=false
-      # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
-      - FAKE_STREAMING=false
-      - FAKE_STREAMING_INTERVAL=1.0
+      #
+      # 下面这些**全部可以不填**：打开 http://localhost:8050 用 123456 登录，
+      # 首次启动向导会一步步引导你在前端设置访问口令、主通道、Express Key / Cookie、
+      # 上游代理、模型列表来源，改完立即热生效并写入 web_state.json，无需重启。
+      # 只有想用“环境变量”作为初始基线时才需要填。
+      #
+      # - API_KEY=change-me-please                 # 控制台登录密码 + 代理 API Key（可前端改）
+      # - VERTEX_EXPRESS_API_KEY=key1,key2         # 仅首次启动导入；之后以控制台列表为准
+      # - GOOGLE_COOKIE=...                        # Cookie 直连通道初始值（可前端改）
+      # - GOOGLE_PROJECT_ID=...                    # 同上
+      # - PROXY_URL=http://127.0.0.1:7890          # 上游代理（可前端改）
+      # - MODELS_CONFIG_URL=https://.../vertexModels.json  # 模型列表来源（可前端改）
+      # - ROUNDROBIN=false / FAKE_STREAMING=false / FAKE_STREAMING_INTERVAL=1.0  # 前端也有开关
     restart: unless-stopped

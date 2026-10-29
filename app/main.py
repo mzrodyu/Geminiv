@@ -1,10 +1,13 @@
 import asyncio
+import json
 import os
+import re
 import secrets
 import threading
 import time
 from typing import Optional
-from fastapi import FastAPI, Depends, Request, HTTPException
+import httpx
+from fastapi import FastAPI, Depends, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -16,9 +19,10 @@ from routes import models_api, chat_api
 
 from logger import rt_logger, stats
 import config
+import runtime_state
 from runtime_state import app_state
 import model_capabilities as mc
-from model_loader import get_express_models
+from model_loader import get_express_models, refresh_models_config_cache
 
 from cookie_auth import validate_cookie
 import express_key_probe
@@ -43,8 +47,13 @@ async def _probe_express_projects_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from model_loader import refresh_models_config_cache
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
+
+    # 先套用控制台「系统设置」里保存过的覆盖值（口令 / 代理 / 模型源），
+    # 这样后面的默认口令检查、模型拉取、各上游客户端都直接使用最新配置。
+    effective = app_state.apply_runtime_config()
+    if effective.get("proxy_url"):
+        print("🌐 [系统配置] 已启用上游代理（来源：控制台设置或环境变量 PROXY_URL）。")
 
     if config.API_KEY == DEFAULT_API_KEY:
         public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
@@ -55,7 +64,7 @@ async def lifespan(app: FastAPI):
                 "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
             )
         print("🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
-              "请立刻改成强口令。")
+              "登录后请到「系统设置」页改成强口令（前端即可修改，无需重启）。")
 
     app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
     if express_key_manager.get_total_keys() > 0:
@@ -221,6 +230,10 @@ body{
 .inp:focus{border-color:#8b7cf6;background:#fff;box-shadow:0 0 0 3px rgba(139,124,246,.16)}
 .btn{background:linear-gradient(135deg,#8b7cf6 0%,#f48fb1 100%);color:#fff;border-radius:12px;font-weight:600;padding:11px;width:100%;transition:.2s;box-shadow:0 4px 12px rgba(139,124,246,.28)}
 .btn:hover{opacity:.94;transform:translateY(-1px)}
+.firstrun{margin-bottom:12px;padding:9px 11px;border-radius:10px;background:#fff8ec;border:1px solid #f6e0bb;color:#96661c;font-size:12px;line-height:1.7}
+.firstrun b{color:#7a4d0c}
+html.dark .firstrun{background:#2a2318;border-color:#4a3a22;color:#fad096}
+html.dark .firstrun b{color:#ffe0b0}
 .theme-seg{display:inline-flex;align-items:center;padding:2px;border-radius:999px;border:1px solid #e6dff2;background:rgba(255,255,255,.85);font-size:12px}
 .theme-seg span{padding:3px 9px;border-radius:999px;cursor:pointer;transition:.18s;color:#7d738e;user-select:none}
 .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#f48fb1);color:#fff;font-weight:600;box-shadow:0 2px 6px rgba(139,124,246,.25)}
@@ -251,6 +264,7 @@ html.dark .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#5fd3bc);
       <span class="text-xl font-bold tracking-tight">agentplatform<span style="color:#8b7cf6">2api</span></span>
     </div>
     <div class="card p-6">
+      __HINT_HTML__
       <p class="text-sm text-[#7c728d] mb-4">请输入访问密码（即 API_KEY）</p>
       <form id="f" onsubmit="return doLogin(event)">
         <input id="pw" type="password" class="inp mb-3.5" placeholder="密码" autofocus autocomplete="current-password">
@@ -475,6 +489,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background:linear-gradient(135deg,rgba(139,124,246,.16) 0%,rgba(95,211,188,.10) 100%);
     box-shadow:0 4px 18px -4px rgba(0,0,0,.5);
   }
+  .wiz-chan {
+    display:flex; align-items:center; gap:8px; cursor:pointer;
+    border:1.5px solid var(--border); border-radius:12px; padding:10px 12px;
+    background:var(--inp-bg); transition:.15s; font-weight:500;
+  }
+  .wiz-chan:hover { border-color:#d4c8f8; }
+  .wiz-chan:has(input:checked) {
+    border-color:var(--accent);
+    background:linear-gradient(135deg,rgba(139,124,246,.08),rgba(95,211,188,.07));
+  }
 
   .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
   .log-item { cursor:pointer; transition:filter .12s ease; }
@@ -575,6 +599,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
     <div class="tab" data-tab="logs" onclick="switchTab('logs')">运行日志</div>
+    <div class="tab" data-tab="system" onclick="switchTab('system')">系统设置</div>
   </nav>
 
   <!-- Overview -->
@@ -956,8 +981,163 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fdfcff]" style="height:64vh"></div>
     </div>
   </section>
+
+  <!-- System：全部基础设施均可在前端配置（含首次启动） -->
+  <section id="view-system" class="tab-pane hidden">
+    <div id="first-run-card" class="card p-5 mb-4 hidden" style="border-color:#f7d9a8">
+      <div class="flex items-start justify-between gap-3 flex-wrap">
+        <div class="min-w-0">
+          <div class="text-sm font-semibold">👋 首次启动初始化还没完成</div>
+          <div class="text-xs text-[#7d738e] mt-1 leading-relaxed">建议按向导走一遍：设置访问口令 → 选主通道并填凭证 → 完成。全部在浏览器里点完，不用改环境变量、不用重启。</div>
+        </div>
+        <button class="btn px-4 py-2 text-sm" onclick="openWizard()">打开 3 步向导</button>
+      </div>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <!-- 访问口令 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <div class="text-sm font-semibold">控制台访问口令（API_KEY）</div>
+          <span id="sys-key-pill" class="pill" style="text-transform:none">—</span>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-1.5 leading-relaxed">这串口令同时是<b>控制台登录密码</b>与 <code>Authorization: Bearer</code> 的调用 Key。改完立即生效、落盘持久化；除当前页面外的已登录会话会被强制退出，外部客户端记得同步更新。</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+          <div><div class="lbl mb-1">新口令（≥8 位）</div><input id="sys-key-new" type="password" class="inp log" autocomplete="new-password" placeholder="至少 8 位，字母+数字更稳"></div>
+          <div><div class="lbl mb-1">再输一遍确认</div><input id="sys-key-confirm" type="password" class="inp log" autocomplete="new-password" placeholder="再输入一遍"></div>
+        </div>
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button class="btn px-4 py-2 text-sm" onclick="saveAdminKey()">保存口令</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="quickRotateKey()">⚡ 一键生成并保存</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="genAdminKey()">随机生成（先预览）</button>
+        </div>
+        <div id="sys-key-show-wrap" class="hidden mt-3">
+          <div class="lbl mb-1">新口令（只在这里显示一次，请立刻复制保存）</div>
+          <div class="flex items-center gap-2">
+            <input id="sys-key-shown" class="inp log" readonly style="user-select:all">
+            <button class="btn-soft px-3 py-2 text-sm flex-shrink-0" onclick="copyShownKey()">复制</button>
+          </div>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-2">保存后立即生效、无需重启；当前页面会自动续期登录。</p>
+      </div>
+
+      <!-- 上游代理 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <div class="text-sm font-semibold">上游代理（PROXY_URL）</div>
+          <span id="sys-proxy-pill" class="pill" style="text-transform:none">—</span>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-1.5 leading-relaxed">支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code>（带认证写成 <code>socks5://user:pass@host:port</code>）。留空即直连。保存后下一次上游请求立刻走新代理。</p>
+        <input id="sys-proxy" class="inp log mt-3" placeholder="http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:1080">
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button class="btn px-4 py-2 text-sm" onclick="saveProxy()">保存代理</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="testProxy()">测试连通性</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="clearProxy()">清空（直连）</button>
+          <span id="sys-proxy-result" class="text-xs text-[#7d738e]"></span>
+        </div>
+      </div>
+
+      <!-- 模型列表来源 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <div class="text-sm font-semibold">模型列表来源（MODELS_CONFIG_URL）</div>
+          <span id="sys-models-count" class="pill pill-accent" style="text-transform:none">—</span>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-1.5 leading-relaxed">默认从仓库 <code>vertexModels.json</code> 拉取；可换成你自己的地址（返回 <code>{"models": ["..."]}</code> 即可）。留空 = 恢复官方默认。保存后会立即刷新模型缓存。</p>
+        <input id="sys-models-url" class="inp log mt-3" placeholder="https://example.com/vertexModels.json">
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button class="btn px-4 py-2 text-sm" onclick="saveModelsSource()">保存并刷新</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="resetModelsSource()">恢复官方默认</button>
+          <span id="sys-models-msg" class="text-xs text-[#7d738e]"></span>
+        </div>
+      </div>
+
+      <!-- 状态与备份 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <div class="text-sm font-semibold">状态持久化与备份</div>
+          <span id="sys-ready-pill" class="pill" style="text-transform:none">—</span>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-1.5 leading-relaxed">Key、Cookie、模型参数、口令、代理全部写在 <code>web_state.json</code>；容器重建请挂载 <code>STATE_DIR</code> 目录，否则配置会丢。</p>
+        <div class="space-y-1.5 text-xs mt-3" style="color:var(--muted)">
+          <div>状态目录：<span id="sys-state-dir" class="log" style="color:var(--fg)">—</span></div>
+          <div>状态文件：<span id="sys-state-file" class="log" style="color:var(--fg)">—</span></div>
+          <div>文件大小：<span id="sys-state-size" style="color:var(--fg)">—</span></div>
+          <div>主通道：<span id="sys-primary" style="color:var(--fg)">—</span> · 可用 Key：<span id="sys-keys" style="color:var(--fg)">0</span> · Cookie：<span id="sys-cookie" style="color:var(--fg)">未配置</span></div>
+        </div>
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button class="btn-soft px-3 py-2 text-sm" onclick="downloadState()">下载配置备份</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="openWizard()">重开首次启动向导</button>
+          <button class="btn-soft px-3 py-2 text-sm" onclick="loadSystem()">刷新状态</button>
+        </div>
+      </div>
+    </div>
+  </section>
 </div>
 <div id="toast" class="toast"></div>
+
+<!-- 首次启动向导 -->
+<div id="wizard" class="fixed inset-0 z-40 hidden" style="background:rgba(24,20,36,.5)">
+  <div class="absolute inset-0 flex items-center justify-center p-4" onclick="if(event.target===this)closeWizard()">
+    <div class="card w-full" style="max-width:600px;padding:22px;background:var(--inp-bg)">
+      <div class="flex items-start justify-between gap-3 mb-4">
+        <div>
+          <div class="text-base font-bold">首次启动向导</div>
+          <div class="text-xs text-[#7d738e] mt-0.5">三步走完即可对外提供 OpenAI 兼容接口</div>
+        </div>
+        <button class="pill" style="cursor:pointer" onclick="closeWizard()">稍后再说</button>
+      </div>
+      <div class="flex items-center gap-2 mb-4">
+        <span class="wiz-dot pill pill-accent" style="text-transform:none">1 访问口令</span>
+        <span class="wiz-dot pill" style="text-transform:none">2 通道与凭证</span>
+        <span class="wiz-dot pill" style="text-transform:none">3 完成</span>
+      </div>
+
+      <div id="wiz-1">
+        <div class="lbl mb-1">控制台访问口令（同时是 API_KEY）</div>
+        <input id="wiz-key-new" type="password" class="inp log mb-2.5" autocomplete="new-password" placeholder="至少 8 位，建议字母 + 数字">
+        <input id="wiz-key-confirm" type="password" class="inp log" autocomplete="new-password" placeholder="再输一遍确认">
+        <p id="wiz-key-tip" class="text-xs text-[#7d738e] mt-2 leading-relaxed">还没修改口令时，默认值就是 <b>123456</b>。谁拿到它就能登录控制台并读取你的 Google 会话 Cookie，务必换掉。</p>
+        <button class="btn-soft px-3 py-2 text-sm mt-3" onclick="wizQuickKey()">⚡ 一键随机口令并保存（推荐）</button>
+      </div>
+
+      <div id="wiz-2" class="hidden">
+        <div class="lbl mb-1.5">主通道</div>
+        <div class="flex flex-col sm:flex-row gap-2.5 mb-3">
+          <label class="flex-1 wiz-chan"><input type="radio" name="wiz-mode" value="api_key" class="accent-[#8b7cf6]" checked><span class="text-sm">Express API Key</span></label>
+          <label class="flex-1 wiz-chan"><input type="radio" name="wiz-mode" value="web_proxy" class="accent-[#8b7cf6]"><span class="text-sm">Cookie 直连</span></label>
+        </div>
+        <div class="lbl mb-1">Express API Key（每行一个，可留空）</div>
+        <textarea id="wiz-keys" rows="3" class="inp log mb-2.5" placeholder="AIza...&#10;AIza..."></textarea>
+        <div class="grid grid-cols-1 gap-2.5">
+          <div>
+            <div class="lbl mb-1">Google Cookie（走 Cookie 通道时填，可留空）</div>
+            <textarea id="wiz-cookie" rows="2" class="inp log" placeholder="粘贴 console.cloud.google.com 的完整 Cookie，支持 Cookie-Editor 导出"></textarea>
+          </div>
+          <div>
+            <div class="lbl mb-1">Google Cloud Project ID（Cookie 通道必填）</div>
+            <input id="wiz-project" class="inp log" placeholder="可直接粘贴含 ?project=xxx 的整条 URL">
+          </div>
+        </div>
+      </div>
+
+      <div id="wiz-3" class="hidden">
+        <div class="text-sm font-semibold mb-2">配置完成 🎉</div>
+        <p class="text-xs text-[#7d738e] leading-relaxed mb-2">接口地址（OpenAI 兼容）：</p>
+        <div class="inp log mb-3" id="wiz-endpoint" style="user-select:all"></div>
+        <p class="text-xs text-[#7d738e] leading-relaxed">之后随时可以在「系统设置」页改口令 / 代理 / 模型源，在「通道与凭证」页增删 Key 与 Cookie，全部热生效。</p>
+      </div>
+
+      <div class="flex items-center justify-between gap-3 mt-5 flex-wrap">
+        <button id="wiz-back" class="btn-soft px-4 py-2 text-sm" onclick="wizPrev()">上一步</button>
+        <div class="flex items-center gap-2">
+          <button class="btn-soft px-3 py-2 text-sm" onclick="wizSkip()">跳过向导</button>
+          <button id="wiz-next" class="btn px-5 py-2 text-sm" onclick="wizNext()">下一步</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
@@ -1012,16 +1192,18 @@ function scrollLogsToBottom(){
 
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(function(e){ e.classList.toggle('active', e.dataset.tab===t); });
-  ['overview','channel','params','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
+  ['overview','channel','params','logs','system'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
   if(t==='logs'){
     autoscroll = true;
     scrollLogsToBottom();
   }
+  if(t==='system'){ loadSystem(); }
 }
 
 /* ---------- Overview (Macaron Donut + Center Percentage & Dynamic Token Bars) ---------- */
 function renderChart(s,e,r){
   lastStats = {s:s, e:e, r:r};
+  if(typeof Chart === 'undefined') return;   /* Chart.js CDN 不可达时不阻塞统计刷新 */
   var ctx=$('donut').getContext('2d');
   var dark = isDarkMode();
   var isEmpty = (s===0 && e===0 && r===0);
@@ -1599,19 +1781,228 @@ try{
 $('project-input').addEventListener('input',function(e){ var v=e.target.value.trim(); var m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
 $('image_aspect_ratio').addEventListener('change', function(e){ curAR=e.target.value; });
 
+/* ---------- 系统设置（口令 / 代理 / 模型源 / 持久化 / 首次启动向导） ---------- */
+var SYS = {}, WIZ_STEP = 1;
+function fmtBytes(n){
+  if(!n) return '0 B';
+  var u=['B','KB','MB','GB'], i=0, v=Number(n);
+  while(v>=1024 && i<u.length-1){ v=v/1024; i++; }
+  return (i===0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+async function loadSystem(){
+  try{
+    var s=await (await fetch('/api/system')).json();
+    SYS=s;
+    var kp=$('sys-key-pill');
+    if(s.api_key_is_default){ kp.textContent='⚠ 默认口令未修改'; kp.className='pill pill-apricot'; }
+    else { kp.textContent='已设置 '+s.api_key_masked; kp.className='pill pill-mint'; }
+    $('sys-proxy').value = s.proxy_url_custom || '';
+    $('sys-proxy').placeholder = s.proxy_url ? ('当前生效：'+s.proxy_url) : 'http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:1080';
+    var pp=$('sys-proxy-pill');
+    pp.textContent = s.proxy_url ? (s.proxy_url_custom ? '控制台设置' : '来自环境变量') : '未启用（直连）';
+    pp.className = 'pill' + (s.proxy_url ? ' pill-accent' : '');
+    $('sys-models-url').value = s.models_config_url_custom || '';
+    $('sys-models-url').placeholder = s.models_config_url || 'https://example.com/vertexModels.json';
+    $('sys-models-count').textContent = (s.models_count||0) + ' 个模型';
+    $('sys-state-dir').textContent = s.state_dir || '—';
+    $('sys-state-file').textContent = s.state_file || '—';
+    $('sys-state-size').textContent = s.state_file_exists ? fmtBytes(s.state_file_size) : '尚未生成（保存任意配置后出现）';
+    $('sys-primary').textContent = s.primary_channel==='web_proxy' ? 'Cookie 直连' : 'Express API Key';
+    $('sys-keys').textContent = (s.express_keys||0) + ' 个';
+    $('sys-cookie').textContent = s.cookie_configured ? '已配置' : '未配置';
+    var rp=$('sys-ready-pill');
+    rp.textContent = s.ready ? '✅ 通道就绪' : '⚠ 还没有可用凭证';
+    rp.className = 'pill ' + (s.ready ? 'pill-mint' : 'pill-apricot');
+    $('first-run-card').classList.toggle('hidden', !s.first_run);
+    $('wiz-key-tip').innerHTML = s.api_key_is_default
+      ? '当前口令仍是默认的 <b>123456</b>，谁拿到它就能登录控制台并读取你的 Google 会话 Cookie，务必换掉。'
+      : ('当前口令已自定义（' + s.api_key_masked + '）。想换一个就填新的，留空则保持不变。');
+    return s;
+  }catch(e){ return null; }
+}
+async function submitAdminKey(a,b){
+  try{
+    var r=await fetch('/api/system/api-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:a,confirm_api_key:b})});
+    var d=await r.json().catch(function(){return {};});
+    if(r.ok){ toast('✅ 访问口令已更新（当前会话已自动续期）'); loadSystem(); return true; }
+    toast('❌ '+(d.error||'保存失败')); return false;
+  }catch(e){ toast('❌ 网络请求失败'); return false; }
+}
+function randKey(n){
+  var chars='abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  var out='', i=0;
+  var c=(window.crypto||window.msCrypto);
+  if(c && c.getRandomValues){
+    var buf=new Uint8Array(n);
+    c.getRandomValues(buf);
+    for(i=0;i<n;i++){ out += chars.charAt(buf[i] % chars.length); }
+    return out;
+  }
+  for(i=0;i<n;i++){ out += chars.charAt(Math.floor(Math.random()*chars.length)); }
+  return out;
+}
+function genAdminKey(){
+  var out=randKey(24);
+  $('sys-key-new').value=out; $('sys-key-confirm').value=out;
+  $('sys-key-show-wrap').classList.add('hidden');
+  toast('已生成随机口令，点「保存口令」立即生效');
+}
+async function quickRotateKey(){
+  var out=randKey(24);
+  if(!await submitAdminKey(out,out)) return false;
+  $('sys-key-new').value=''; $('sys-key-confirm').value='';
+  $('sys-key-shown').value=out;
+  $('sys-key-show-wrap').classList.remove('hidden');
+  try{ await navigator.clipboard.writeText(out); toast('⚡ 新口令已保存并复制到剪贴板'); }
+  catch(e){ toast('⚡ 新口令已保存，请手动复制下方口令'); }
+  return true;
+}
+async function copyShownKey(){
+  var v=$('sys-key-shown').value;
+  try{ await navigator.clipboard.writeText(v); toast('📋 已复制新口令'); }
+  catch(e){ toast('请手动选中复制'); }
+}
+async function wizQuickKey(){
+  if(await quickRotateKey()){ WIZ_STEP=2; renderWizard(); }
+}
+async function saveAdminKey(){
+  var a=$('sys-key-new').value.trim(), b=$('sys-key-confirm').value.trim();
+  if(a.length<8){ toast('口令至少 8 位'); return; }
+  if(a!==b){ toast('两次输入不一致'); return; }
+  if(await submitAdminKey(a,b)){ $('sys-key-new').value=''; $('sys-key-confirm').value=''; }
+}
+async function saveProxyValue(v){
+  try{
+    var r=await fetch('/api/system/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    var d=await r.json().catch(function(){return {};});
+    if(r.ok){ toast(v ? ('✅ 代理已保存：'+v) : '✅ 已清空代理，改为直连'); loadSystem(); return true; }
+    toast('❌ '+(d.error||'保存失败')); return false;
+  }catch(e){ toast('❌ 网络请求失败'); return false; }
+}
+function saveProxy(){ saveProxyValue($('sys-proxy').value.trim()); }
+function clearProxy(){ $('sys-proxy').value=''; saveProxyValue(''); }
+async function testProxy(){
+  var v=$('sys-proxy').value.trim();
+  $('sys-proxy-result').textContent='测试中…';
+  try{
+    var r=await fetch('/api/system/proxy/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    var d=await r.json();
+    $('sys-proxy-result').textContent = d.ok
+      ? ('✅ 连通（HTTP '+d.status_code+' · '+d.elapsed_ms+' ms）')
+      : ('❌ '+(d.error||'不通'));
+  }catch(e){ $('sys-proxy-result').textContent='❌ 请求失败'; }
+}
+async function saveModelsSource(){
+  var u=$('sys-models-url').value.trim();
+  $('sys-models-msg').textContent='拉取中…';
+  try{
+    var r=await fetch('/api/system/models-source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
+    var d=await r.json().catch(function(){return {};});
+    $('sys-models-msg').textContent = r.ok ? ('✅ 已刷新：'+(d.count||0)+' 个模型') : ('❌ '+(d.error||'刷新失败'));
+    loadSystem(); loadParams();
+  }catch(e){ $('sys-models-msg').textContent='❌ 请求失败'; }
+}
+function resetModelsSource(){ $('sys-models-url').value=''; saveModelsSource(); }
+function downloadState(){ window.open('/api/system/state-backup','_blank'); }
+
+function renderWizard(){
+  [1,2,3].forEach(function(i){ var el=$('wiz-'+i); if(el) el.classList.toggle('hidden', i!==WIZ_STEP); });
+  var dots=document.querySelectorAll('.wiz-dot');
+  Array.prototype.forEach.call(dots, function(el, idx){
+    el.className = 'wiz-dot pill' + ((idx+1)===WIZ_STEP ? ' pill-accent' : '');
+  });
+  $('wiz-back').style.visibility = (WIZ_STEP===1 ? 'hidden' : 'visible');
+  $('wiz-next').textContent = (WIZ_STEP===3 ? '完成并进入控制台' : '下一步');
+  if(WIZ_STEP===3){ $('wiz-endpoint').textContent = window.location.origin + '/v1'; }
+}
+function openWizard(){ WIZ_STEP=1; $('wizard').classList.remove('hidden'); renderWizard(); }
+function closeWizard(){ $('wizard').classList.add('hidden'); }
+function wizPrev(){ if(WIZ_STEP>1){ WIZ_STEP--; renderWizard(); } }
+async function wizSkip(){
+  try{ await fetch('/api/system/setup-complete',{method:'POST'}); }catch(e){}
+  closeWizard(); toast('已跳过向导，随时可在「系统设置」页重开'); loadSystem();
+}
+async function wizNext(){
+  if(WIZ_STEP===1){
+    var a=$('wiz-key-new').value.trim(), b=$('wiz-key-confirm').value.trim();
+    if(a||b){
+      if(a.length<8){ toast('口令至少 8 位'); return; }
+      if(a!==b){ toast('两次输入不一致'); return; }
+      if(!await submitAdminKey(a,b)) return;
+      $('wiz-key-new').value=''; $('wiz-key-confirm').value='';
+    }
+    WIZ_STEP=2; renderWizard(); return;
+  }
+  if(WIZ_STEP===2){
+    var modeEl=document.querySelector('input[name=wiz-mode]:checked');
+    var mode=modeEl ? modeEl.value : 'api_key';
+    try{ await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})}); }catch(e){}
+    var raw=$('wiz-keys').value.trim();
+    if(raw){
+      var keys=raw.split(/[\s,;]+/).filter(Boolean).map(function(k){ return {key:k, enabled:true}; });
+      try{
+        var r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:keys})});
+        if(!r.ok){ var de=await r.json().catch(function(){return {};}); toast('❌ Key 保存失败：'+(de.error||'')); return; }
+      }catch(e){ toast('❌ 网络请求失败'); return; }
+    }
+    var ck=$('wiz-cookie').value.trim(), pid=$('wiz-project').value.trim();
+    if(ck||pid){
+      var m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
+      try{
+        var r2=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
+        var d2=await r2.json().catch(function(){return {};});
+        if(!r2.ok){ toast('❌ '+(d2.error||'Cookie 保存失败')); return; }
+      }catch(e){ toast('❌ 网络请求失败'); return; }
+    }
+    loadRuntime(); loadExpressKeys();
+    WIZ_STEP=3; renderWizard(); return;
+  }
+  try{ await fetch('/api/system/setup-complete',{method:'POST'}); }catch(e){}
+  closeWizard(); toast('🎉 初始化完成，可以开始用了'); loadSystem();
+}
+
 /* init */
 fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
+loadSystem().then(function(){
+  if(!SYS || !SYS.first_run) return;
+  var seen='';
+  try{ seen=localStorage.getItem('ap_wiz_seen')||''; }catch(e){}
+  if(seen) return;
+  try{ localStorage.setItem('ap_wiz_seen','1'); }catch(e){}
+  openWizard();
+});
+setTimeout(function(){
+  if(!window.tailwind){
+    toast('⚠ 样式 CDN（cdn.tailwindcss.com）不可达，页面可能显示错乱：先在「系统设置」配好上游代理再刷新即可');
+  }
+}, 2500);
 </script>
 </body>
 </html>
 """
 
 
+def _login_hint_html() -> str:
+    """登录页提示：首次启动 / 默认口令都直接在前端引导改掉。"""
+    hints = []
+    if app_state.is_first_run():
+        hints.append(
+            '<div class="firstrun">👋 <b>首次启动</b>：初始化还没完成。登录后会自动弹出 3 步向导'
+            '（设置访问口令 → 选主通道并填凭证 → 完成），全程浏览器操作。</div>'
+        )
+    if config.API_KEY == DEFAULT_API_KEY:
+        hints.append(
+            '<div class="firstrun">🔑 当前口令仍是默认的 <b>123456</b>（同时是控制台登录密码与 API Key）。'
+            '登录后到「系统设置」页一键换成强口令，改完立即生效。</div>'
+        )
+    return "".join(hints)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard_ui(request: Request):
     if _is_authed(request):
         return HTMLResponse(DASHBOARD_HTML)
-    return HTMLResponse(LOGIN_HTML)
+    return HTMLResponse(LOGIN_HTML.replace("__HINT_HTML__", _login_hint_html()))
 
 
 class LoginBody(BaseModel):
@@ -1838,6 +2229,184 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
     if project_id:
         app_state.set_project_id(project_id)
     return JSONResponse(content={"status": "success", "message": message})
+
+
+# ==========================================
+# 系统设置（首次启动向导 / 访问口令 / 代理 / 模型源 / 状态备份）
+# 全部能力都可直接在前端完成，不需要改环境变量或重启进程。
+# ==========================================
+class AdminKeyBody(BaseModel):
+    api_key: str = ""
+    confirm_api_key: str = ""
+
+
+class ProxySetting(BaseModel):
+    proxy_url: str = ""
+
+
+class ModelsSourceSetting(BaseModel):
+    url: str = ""
+
+
+PROXY_SCHEME_RE = re.compile(r"^(https?|socks5h?|socks4a?)://", re.IGNORECASE)
+
+
+def _mask_secret(value: str) -> str:
+    v = str(value or "")
+    if len(v) <= 4:
+        return "*" * len(v)
+    if len(v) <= 8:
+        return v[0] + "*" * (len(v) - 2) + v[-1]
+    return v[:3] + "*" * (len(v) - 6) + v[-3:]
+
+
+@app.get("/api/system")
+async def get_system_info(_auth: bool = Depends(require_auth)):
+    override = app_state.get_runtime_config()
+    effective = app_state.get_effective_runtime_config()
+    records = app_state.get_express_keys()
+    enabled = [r for r in records if r.get("enabled", True)]
+    cookie_configured = bool(app_state.get_google_cookie())
+    try:
+        models = await get_express_models()
+    except Exception:
+        models = []
+    state_path = os.path.abspath(runtime_state.STATE_FILE)
+    exists = os.path.exists(state_path)
+    return JSONResponse(content={
+        "first_run": app_state.is_first_run(),
+        "setup_completed": app_state.is_setup_completed(),
+        "api_key_masked": _mask_secret(config.API_KEY),
+        "api_key_is_default": config.API_KEY == DEFAULT_API_KEY,
+        "api_key_source": "console" if override.get("api_key") else "env",
+        "proxy_url": effective.get("proxy_url", ""),
+        "proxy_url_custom": override.get("proxy_url", ""),
+        "models_config_url": effective.get("models_config_url", ""),
+        "models_config_url_custom": override.get("models_config_url", ""),
+        "models_count": len(models),
+        "express_keys": len(records),
+        "express_keys_enabled": len(enabled),
+        "cookie_configured": cookie_configured,
+        "primary_channel": "web_proxy" if app_state.is_web_proxy_enabled() else "api_key",
+        "state_dir": os.path.abspath(runtime_state.STATE_DIR),
+        "state_file": state_path,
+        "state_file_exists": exists,
+        "state_file_size": os.path.getsize(state_path) if exists else 0,
+        "ready": bool(enabled or cookie_configured),
+    })
+
+
+@app.post("/api/system/api-key")
+async def update_admin_key(body: AdminKeyBody, request: Request, _auth: bool = Depends(require_auth)):
+    new_key = (body.api_key or "").strip()
+    if len(new_key) < 8:
+        return JSONResponse(status_code=400, content={"error": "访问口令至少 8 位。"})
+    if new_key == DEFAULT_API_KEY:
+        return JSONResponse(status_code=400, content={"error": "不能用默认口令 123456，请换一个强口令。"})
+    if body.confirm_api_key and body.confirm_api_key.strip() != new_key:
+        return JSONResponse(status_code=400, content={"error": "两次输入不一致。"})
+
+    app_state.update_runtime_config({"api_key": new_key})
+    with _sessions_lock:
+        _sessions.clear()          # 旧会话 / 其它浏览器立即失效
+    token = _issue_session()
+    print("🔐 [系统设置] 控制台访问口令已更新，旧会话已全部失效（外部客户端需同步更新 Bearer Token）。")
+
+    resp = JSONResponse(content={
+        "status": "success",
+        "api_key_masked": _mask_secret(config.API_KEY),
+        "message": "访问口令已更新，当前会话已自动续期。",
+    })
+    resp.set_cookie(
+        AUTH_COOKIE, token,
+        httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS, path="/",
+        secure=(request.url.scheme == "https"
+                or request.headers.get("x-forwarded-proto", "") == "https"),
+    )
+    return resp
+
+
+@app.post("/api/system/proxy")
+async def save_proxy_setting(body: ProxySetting, _auth: bool = Depends(require_auth)):
+    raw = (body.proxy_url or "").strip()
+    if raw and not PROXY_SCHEME_RE.match(raw):
+        return JSONResponse(status_code=400, content={
+            "error": "代理地址需以 http:// 、https:// 、socks5:// 或 socks4:// 开头。"})
+    app_state.update_runtime_config({"proxy_url": raw})
+    if raw:
+        print(f"🌐 [系统设置] 上游代理已更新：{raw}")
+    else:
+        print("🌐 [系统设置] 已清空上游代理，恢复直连。")
+    return JSONResponse(content={
+        "status": "success",
+        "proxy_url": app_state.get_effective_runtime_config().get("proxy_url", ""),
+        "message": "代理已保存，下一次上游请求立即生效。" if raw else "已清空代理，恢复直连。",
+    })
+
+
+@app.post("/api/system/proxy/test")
+async def test_proxy_setting(body: ProxySetting, _auth: bool = Depends(require_auth)):
+    """用给定代理（留空则用当前生效值）访问 Google 生成 204 的探测地址。"""
+    proxy_url = (body.proxy_url or "").strip() or app_state.get_effective_runtime_config().get("proxy_url", "")
+    if proxy_url and not PROXY_SCHEME_RE.match(proxy_url):
+        return JSONResponse(status_code=400, content={"error": "代理地址格式不正确。"})
+    started = time.time()
+    client_args = {"timeout": 12.0, "follow_redirects": True}
+    if proxy_url:
+        client_args["proxy"] = proxy_url
+    try:
+        async with httpx.AsyncClient(**client_args) as client:
+            resp = await client.get("https://www.google.com/generate_204")
+        return JSONResponse(content={
+            "ok": resp.status_code < 400,
+            "status_code": resp.status_code,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "proxy_url": proxy_url,
+            "error": "" if resp.status_code < 400 else f"HTTP {resp.status_code}",
+        })
+    except Exception as e:
+        return JSONResponse(content={
+            "ok": False,
+            "status_code": 0,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "proxy_url": proxy_url,
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+
+@app.post("/api/system/models-source")
+async def save_models_source(body: ModelsSourceSetting, _auth: bool = Depends(require_auth)):
+    url = (body.url or "").strip()
+    if url and not re.match(r"^https?://", url, re.IGNORECASE):
+        return JSONResponse(status_code=400, content={"error": "模型列表地址需以 http:// 或 https:// 开头。"})
+    app_state.update_runtime_config({"models_config_url": url})
+    print(f"🧩 [系统设置] 模型列表来源已{'重置为官方默认' if not url else '更新为 ' + url}，正在刷新缓存。")
+    ok = await refresh_models_config_cache()
+    models = await get_express_models()
+    return JSONResponse(content={
+        "status": "success" if ok else "warning",
+        "models_config_url": app_state.get_effective_runtime_config().get("models_config_url", ""),
+        "models": models,
+        "count": len(models),
+        "error": "" if ok else "远程地址拉取失败，已回退到本地 vertexModels.json 或旧缓存。",
+    })
+
+
+@app.post("/api/system/setup-complete")
+async def complete_setup(_auth: bool = Depends(require_auth)):
+    app_state.mark_setup_completed()
+    print("✅ [系统设置] 首次启动向导已标记完成。")
+    return JSONResponse(content={"status": "success", "setup_completed": True})
+
+
+@app.get("/api/system/state-backup")
+async def download_state_backup(_auth: bool = Depends(require_auth)):
+    payload = json.dumps(app_state.export_state(), ensure_ascii=False, indent=2)
+    return Response(
+        content=payload,
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="web_state.json"'},
+    )
 
 
 @app.get("/stream-logs")
