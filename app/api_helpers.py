@@ -25,6 +25,7 @@ from schema_validation import (
     sanitize_tool_schema,
 )
 from logger import stats
+from resumable import strict_sse_compat
 
 
 def _safety_score_enabled() -> bool:
@@ -1173,7 +1174,9 @@ async def execute_unified_completion(
         outer_keep_alive_interval = max(0.5, outer_keep_alive_interval)
 
         def _make_keepalive_chunk() -> str:
-            if fake_stream_on or is_image_request:
+            # SSE 严格兼容模式下保活也用合法 JSON 帧（不发 `: comment` 注释行），
+            # 这样最笨的逐行 json.loads 客户端也不会炸在 char 0。
+            if fake_stream_on or is_image_request or strict_sse_compat():
                 keep_alive_data = {
                     "id": "chatcmpl-keepalive",
                     "object": "chat.completion.chunk",
@@ -1185,7 +1188,9 @@ async def execute_unified_completion(
             return ": keep-alive\n\n"
 
         async def _unified_stream_generator():
-            if not (fake_stream_on or is_image_request):
+            if strict_sse_compat():
+                yield _make_keepalive_chunk()
+            elif not (fake_stream_on or is_image_request):
                 yield ": keep-alive\n\n"
 
             for attempt in range(max_retries + 1):

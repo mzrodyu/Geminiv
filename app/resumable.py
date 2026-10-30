@@ -395,9 +395,20 @@ def _as_text(chunk: Any) -> str:
 
 
 def frame_with_id(seq: int, frame: str) -> str:
-    if frame.startswith("data:"):
-        return f"id: {seq}\n{frame}"
-    return frame
+    if not frame.startswith("data:"):
+        return frame
+    if strict_sse_compat():
+        # 严格兼容模式：不写 `id:` 行（续传仍可用 ?resume_from= / X-Resume-Id 头）
+        return frame
+    return f"id: {seq}\n{frame}"
+
+
+def strict_sse_compat() -> bool:
+    """是否只输出 `data: {...}` 行（把非 data 行全部去掉，兼容最笨的逐行解析客户端）。"""
+    try:
+        return bool(_setting("sse_strict_compat"))
+    except Exception:
+        return True
 
 
 async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -> None:
@@ -494,7 +505,7 @@ async def sse_from_buffer(
                 except Exception:
                     pass
 
-            if fake_on:
+            if fake_on or strict_sse_compat():
                 yield make_keepalive_sse(buf.model)
             else:
                 yield ": keep-alive\n\n"

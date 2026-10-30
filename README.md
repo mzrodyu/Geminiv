@@ -254,4 +254,5 @@ uvicorn main:app --host 0.0.0.0 --port 7860
 - **流必定以 `finish_reason` + `data: [DONE]` 收尾**：上游断流、只返回思考、异常中断都会被兜成标准 SSE 帧；完全没产出时返回可读的 502 诊断，而不是让客户端对残留空串 `json.loads("")` 抛 `JSONDecodeError`。
 - **工具参数 Schema 自动净化**：`$schema` / `$defs` / `$ref` / `patternProperties` / `additionalProperties` / `prefixItems` / `const` / `if-then-else` 等 Gemini 不接受的关键字会被去掉，`$ref` 就地展开、`allOf` 合并、`const → enum`、`["string","null"] → nullable`。
 - **工具回放容错**：客户端回传的 `tool_calls.function.arguments` 为空串/缺字段时会归一成 `{}`，不再 400/500。
+- **SSE 严格兼容模式（默认开）**：流里只出现 `data: {...}` 行，不写 `id:` 序号行、不发 `: keep-alive` 注释帧，保活心跳也改成合法 JSON 帧。自写的 Python / Node bot 逐行 `json.loads` 时不会再抛 `Expecting value: line 1 column 1 (char 0)`；需要浏览器 EventSource 自动续传时，在「模型参数 → ② 全局设置」关掉该开关即可。
 - 开「出站参数调试日志」后，控制台会打印净化过的工具数量，便于确认是不是 Schema 问题。

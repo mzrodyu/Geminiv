@@ -943,6 +943,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
           <div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">SSE 严格兼容模式<span class="helpq" onclick="hlp(this,'h_strict')">?</span></span><label class="switch"><input type="checkbox" id="sse_strict_compat"><span class="slider"></span></label></div>
+            <div id="h_strict" class="helpbox">只输出 <code>data: {...}</code> 行：不写 <code>id:</code> 序号行、不发 <code>: keep-alive</code> 注释帧。<br>某些自写客户端（Python/Node bot）会把响应<b>逐行</b> <code>json.loads</code>，一碰到非 data 行就报 <code>JSONDecodeError: Expecting value: line 1 column 1 (char 0)</code>；开着最稳（默认开）。关掉恢复标准 SSE（带 id 行，浏览器 EventSource 可凭 Last-Event-ID 自动续传；续传仍可用 <code>?resume_from=</code>）。</div>
+          </div>
+          <div>
             <div class="flex items-center justify-between gap-2"><span class="text-sm">多 Key 轮询（round-robin）<span class="helpq" onclick="hlp(this,'h_rr')">?</span></span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
             <div id="h_rr" class="helpbox">开启后，每次新请求按顺序轮流从下一个 Express Key 开始调用；关闭则随机挑选起始 Key。无论开启或关闭，单次请求触发重试时都会自动遍历其余可用 Key，绝不死磕同一个 Key。</div>
           </div>
@@ -1555,7 +1559,7 @@ async function loadParams(){
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
       'cookie_debug','debug_outbound','prefill_suppress_thinking',
       'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled',
-      'cross_channel_fallback'
+      'cross_channel_fallback','sse_strict_compat'
     ].forEach(function(k){setV(k,s[k]);});
   }catch(e){}
   try{
@@ -1733,6 +1737,7 @@ async function saveSettings(){
     safety_score:$('safety_score').checked,
     debug_outbound:$('debug_outbound').checked,
     cookie_debug:$('cookie_debug').checked,
+    sse_strict_compat:$('sse_strict_compat').checked,
   };
   try{
     var r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});

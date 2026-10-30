@@ -249,12 +249,71 @@ async def test_tool_call_replay():
     check("empty tool arguments replay safe", ok, extra)
 
 
+async def test_sse_strict_compat():
+    """严格兼容模式：线上只出现 data: 行，最笨的逐行 json.loads 客户端也不会炸。"""
+    from resumable import frame_with_id
+    from runtime_state import app_state
+
+    body_frame = 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+    keepalive = ('data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk","created":0,'
+                 '"model":"m","choices":[{"delta":{"content":""},"index":0,"finish_reason":null}]}\n\n')
+
+    def naive_parse(body: str):
+        """模拟「逐行 json.loads」的客户端（只会跳过空行和 [DONE]）。"""
+        for line in body.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if not s.startswith("data: "):
+                raise json.JSONDecodeError("Expecting value", s, 0)
+            payload = s[len("data: "):]
+            if payload == "[DONE]":
+                continue
+            json.loads(payload)
+
+    app_state.update_settings({"sse_strict_compat": True})
+    strict_wire = "".join([frame_with_id(0, keepalive), frame_with_id(1, body_frame), frame_with_id(2, "data: [DONE]\n\n")])
+    check("strict wire has no id: line", "id: " not in strict_wire)
+    check("strict wire has no SSE comment", ": keep-alive" not in strict_wire)
+    err = None
+    try:
+        naive_parse(strict_wire)
+    except Exception as e:  # noqa: BLE001
+        err = e
+    check("naive client can parse strict stream", err is None, repr(err))
+
+    # 关掉严格模式（= 旧行为）：复现用户上报的那条错误
+    app_state.update_settings({"sse_strict_compat": False})
+    legacy_wire = frame_with_id(0, body_frame)
+    check("legacy wire has id: line", legacy_wire.startswith("id: "))
+    err2 = None
+    try:
+        naive_parse(legacy_wire)
+    except Exception as e:  # noqa: BLE001
+        err2 = e
+    check("legacy stream reproduces reported JSONDecodeError",
+          isinstance(err2, json.JSONDecodeError) and "line 1 column 1" in str(err2),
+          repr(err2))
+
+    # 收尾保护产出的流也必须全是 data 行
+    async def one_chunk():
+        yield body_frame
+
+    frames = await collect(api_helpers._terminate_stream_safely(one_chunk(), "m"))
+    wire = "".join(frames_to_text(frames))
+    non_data = [ln for ln in wire.splitlines() if ln.strip() and not ln.strip().startswith("data:")]
+    check("terminate wrapper emits only data lines", not non_data, str(non_data[:3]))
+
+    app_state.update_settings({"sse_strict_compat": True})
+
+
 async def main():
     await test_terminate_tail()
     await test_cookie_stream_without_done()
     await test_cookie_json_response()
     await test_tool_schema()
     await test_tool_call_replay()
+    await test_sse_strict_compat()
     failed = 0
     print("\n==== RESULT ====")
     for name, ok, extra in results:

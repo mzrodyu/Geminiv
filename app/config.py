@@ -96,6 +96,10 @@ DEFAULT_SETTINGS = {
     # log_time_format: "time"（HH:MM:SS） 或 "datetime"（MM-DD HH:MM:SS）
     "log_timezone": "Asia/Shanghai",
     "log_time_format": "time",
+    # SSE 严格兼容模式：只输出 `data: {...}` 行（不写 `id:` 序号行、不发 `: keep-alive` 注释帧）。
+    # 有些客户端（自写的 Python/Node bot）会把响应逐行 json.loads，遇到非 data 行就报
+    # JSONDecodeError: Expecting value: line 1 column 1 (char 0)。默认开启最稳。
+    "sse_strict_compat": True,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     "model_overrides": {},
 }

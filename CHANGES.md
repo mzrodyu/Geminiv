@@ -1,3 +1,18 @@
+## 2026-10-30 SSE 严格兼容模式：只输出 `data:` 行（治客户端 JSONDecodeError）
+
+- 用户上报：`json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0) <- builtins.StopIteration: 0`。
+- 定位：**这条不是服务端文案**（我们的错误统一是 `【诊断】…` 中文格式，且流已保证 finish + `[DONE]`）。它是调用方把响应**逐行** `json.loads` 时炸的：
+  - `id: 12`（弱网续传的序号行）、`: keep-alive`（SSE 注释保活帧）都不是 JSON，`json.loads` 直接 `Expecting value: line 1 column 1 (char 0)`；
+  - 迭代器耗尽（`StopIteration`）后再拿残留空串解析，就是上报里 `<- builtins.StopIteration` 的来源。
+- 新增设置 `sse_strict_compat`（**默认开启**）：流里只出现 `data: {...}` 行 ——
+  - `frame_with_id()` 不再写 `id:` 前缀行（续传仍可用 `?resume_from=` / `X-Resume-Id` 头）；
+  - 保活心跳从 `: keep-alive` 注释帧改成合法的 `chatcmpl-keepalive` JSON 帧（`resumable.sse_from_buffer` 与 `api_helpers._make_keepalive_chunk` 同步）；
+  - 首帧也发 JSON 保活，避免客户端在等首包时拿到空响应。
+  - 想恢复标准 SSE（浏览器 EventSource 可凭 `Last-Event-ID` 自动续传）时，在控制台「模型参数 → ② 全局设置」关掉该开关即可。
+- 测试：`tests/smoke_stream_and_tools.py` 增加 6 项断言，其中一条**用旧行为复现出同一条 JSONDecodeError**，再用严格模式证明可被最笨的逐行解析客户端正常消费（40 项全过）。
+
+---
+
 ## 2026-10-30 运行日志时区：默认北京时间（容器 UTC 也不影响）
 
 - 症状：Docker 容器默认 `TZ=UTC`，运行日志 `[HH:MM:SS]` 比北京时间慢 8 小时。
