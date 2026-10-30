@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import tempfile
 
@@ -83,6 +84,19 @@ with TestClient(main.app) as c:
     check("models url saved", r.status_code == 200 and r.json()["count"] == 2, r.text[:160])
     r = c.post("/api/system/models-source", json={"url": ""})
     check("models url reset", r.status_code == 200 and main.config.MODELS_CONFIG_URL == "")
+
+    # 9.5) 日志时区：默认北京时间，可在前端切成 UTC / 带日期
+    sysinfo = c.get("/api/system").json()
+    check("log tz default Beijing", sysinfo.get("log_timezone") == "Asia/Shanghai", str(sysinfo.get("log_timezone")))
+    check("log tz label beijing", "北京时间" in str(sysinfo.get("log_timezone_label")), str(sysinfo.get("log_timezone_label")))
+    check("log time preview format", bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", str(sysinfo.get("log_time_preview")) or "")))
+    check("settings accept log tz", c.post("/api/settings", json={"log_timezone": "UTC"}).status_code == 200)
+    check("log tz switched", c.get("/api/system").json().get("log_timezone") == "UTC")
+    check("datetime format applied", c.post("/api/settings", json={"log_time_format": "datetime"}).status_code == 200)
+    dt_preview = c.get("/api/system").json().get("log_time_preview", "")
+    check("datetime preview has date", bool(re.fullmatch(r"\d{2}-\d{2} \d{2}:\d{2}:\d{2}", str(dt_preview) or "")), str(dt_preview))
+    # 恢复北京时间，避免影响后续断言
+    c.post("/api/settings", json={"log_timezone": "Asia/Shanghai", "log_time_format": "time"})
 
     # 10) 状态备份
     r = c.get("/api/system/state-backup")

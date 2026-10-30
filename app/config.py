@@ -91,6 +91,11 @@ DEFAULT_SETTINGS = {
     "resumable_enabled": True,
     "resumable_ttl_seconds": 1800,
     "resumable_max_streams": 200,
+    # 运行日志时间显示：默认北京时间（不依赖容器 TZ / tzdata）
+    # log_timezone: IANA 名（Asia/Shanghai）或 "local"（跟随服务器本地时区）
+    # log_time_format: "time"（HH:MM:SS） 或 "datetime"（MM-DD HH:MM:SS）
+    "log_timezone": "Asia/Shanghai",
+    "log_time_format": "time",
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     "model_overrides": {},
 }

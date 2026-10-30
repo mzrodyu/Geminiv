@@ -3,10 +3,93 @@ import time
 import asyncio
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+# ============================================================
+# 日志时间显示：默认北京时间（容器默认 UTC 也不受影响）
+# - 优先用 zoneinfo（安装 tzdata 时支持任意 IANA 时区）
+# - 没有 tzdata 时回退到固定偏移（Asia/Shanghai = UTC+8，永远可用）
+# - log_timezone="local" 则跟随服务器本地时区
+# ============================================================
+
+DEFAULT_LOG_TIMEZONE = "Asia/Shanghai"
+DEFAULT_LOG_TIME_FORMAT = "time"
+
+_FIXED_TZ_HOURS = {
+    "Asia/Shanghai": 8, "Asia/Chongqing": 8, "Asia/Harbin": 8,
+    "Asia/Hong_Kong": 8, "Asia/Macau": 8, "Asia/Taipei": 8,
+    "Asia/Singapore": 8, "Asia/Kuala_Lumpur": 8,
+    "UTC": 0, "Etc/UTC": 0,
+    "Asia/Tokyo": 9, "Asia/Seoul": 9,
+    "Europe/London": 0, "America/New_York": -5, "America/Los_Angeles": -8,
+}
+
+LOCAL_TZ_ALIASES = {"", "local", "server", "system", "系统", "本地"}
+
+
+def _log_prefs() -> tuple:
+    """读取控制台保存的日志时区/格式（读不到就用默认值）。"""
+    try:
+        from runtime_state import app_state
+        tz = app_state.get_setting("log_timezone", DEFAULT_LOG_TIMEZONE)
+        fmt = app_state.get_setting("log_time_format", DEFAULT_LOG_TIME_FORMAT)
+        return str(tz or DEFAULT_LOG_TIMEZONE), str(fmt or DEFAULT_LOG_TIME_FORMAT)
+    except Exception:
+        return DEFAULT_LOG_TIMEZONE, DEFAULT_LOG_TIME_FORMAT
+
+
+def _resolve_timezone(name: str):
+    """返回 tzinfo；None 表示跟随系统本地时区。"""
+    raw = (name or "").strip()
+    if raw.lower() in LOCAL_TZ_ALIASES:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(raw)
+    except Exception:
+        pass
+    hours = _FIXED_TZ_HOURS.get(raw)
+    if hours is None:
+        return None
+    return timezone(timedelta(hours=hours))
+
+
+def format_timestamp(ts: Optional[float] = None) -> str:
+    """按控制台设置格式化日志时间戳。"""
+    tz_name, fmt = _log_prefs()
+    tz = _resolve_timezone(tz_name)
+    stamp = time.time() if ts is None else ts
+    dt = datetime.fromtimestamp(stamp, tz)
+    return dt.strftime("%m-%d %H:%M:%S") if str(fmt).lower() in ("datetime", "full", "date") \
+        else dt.strftime("%H:%M:%S")
+
+
+def describe_log_timezone() -> dict:
+    """给控制台展示用：当前生效时区 + 一个实时样例。"""
+    tz_name, fmt = _log_prefs()
+    tz = _resolve_timezone(tz_name)
+    sample = datetime.fromtimestamp(time.time(), tz)
+    offset = sample.strftime("%z")
+    offset_txt = f"UTC{offset[:3]}:{offset[3:]}" if offset else ""
+    label = {
+        "Asia/Shanghai": "北京时间",
+        "Asia/Hong_Kong": "香港时间",
+        "Asia/Taipei": "台北时间",
+        "Asia/Singapore": "新加坡时间",
+        "Asia/Tokyo": "东京时间",
+        "UTC": "UTC",
+    }.get(tz_name, "服务器本地时区" if tz is None else tz_name)
+    return {
+        "log_timezone": tz_name,
+        "log_time_format": fmt,
+        "log_timezone_label": f"{label} ({offset_txt})" if offset_txt else label,
+        "log_time_preview": format_timestamp(),
+    }
+
 
 
 class ProxyStats:
@@ -108,7 +191,7 @@ class SSELogger:
                 pass
 
     def push(self, plain_text: str) -> None:
-        timestamp = time.strftime("%H:%M:%S")
+        timestamp = format_timestamp()
         formatted_msg = f"[{timestamp}] {plain_text}"
 
         with self._lock:

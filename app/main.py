@@ -17,7 +17,7 @@ from auth import get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 
-from logger import rt_logger, stats
+from logger import rt_logger, stats, describe_log_timezone
 import config
 import runtime_state
 from runtime_state import app_state
@@ -974,7 +974,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="px-4 py-2.5 border-b border-[#ece5f5] log-header flex items-center justify-between bg-[#faf8ff] flex-wrap gap-2">
         <div class="flex items-center gap-2">
           <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
-          <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控（点击单条日志可复制）</span>
+          <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控（点击单条日志可复制）</span><span id="log-tz-label" class="text-xs log" style="color:#8a7fa0"></span>
         </div>
         <button class="btn-soft px-2.5 py-1 text-xs" onclick="clearLogs()">清空</button>
       </div>
@@ -1069,6 +1069,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button class="btn-soft px-3 py-2 text-sm" onclick="downloadState()">下载配置备份</button>
           <button class="btn-soft px-3 py-2 text-sm" onclick="openWizard()">重开首次启动向导</button>
           <button class="btn-soft px-3 py-2 text-sm" onclick="loadSystem()">刷新状态</button>
+        </div>
+      </div>
+
+      <!-- 运行日志时区 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <div class="text-sm font-semibold">运行日志时区与格式</div>
+          <span id="sys-tz-pill" class="pill pill-mint" style="text-transform:none">—</span>
+        </div>
+        <p class="text-xs text-[#7d738e] mt-1.5 leading-relaxed">Docker 容器默认是 UTC，这里<b>默认已固定为北京时间</b>（不依赖系统 tzdata，装了 tzdata 才支持任意 IANA 时区）。保存后新日志立即用新时区，历史日志保持原样。</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+          <div>
+            <div class="lbl mb-1">时区</div>
+            <select id="sys-log-tz" class="inp">
+              <option value="Asia/Shanghai">北京时间 UTC+8（推荐）</option>
+              <option value="Asia/Hong_Kong">香港 UTC+8</option>
+              <option value="Asia/Taipei">台北 UTC+8</option>
+              <option value="Asia/Singapore">新加坡 UTC+8</option>
+              <option value="Asia/Tokyo">东京 UTC+9</option>
+              <option value="UTC">UTC</option>
+              <option value="local">跟随服务器本地时区</option>
+              <option value="custom">其他（手填 IANA）</option>
+            </select>
+          </div>
+          <div>
+            <div class="lbl mb-1">格式</div>
+            <select id="sys-log-fmt" class="inp">
+              <option value="time">HH:MM:SS</option>
+              <option value="datetime">MM-DD HH:MM:SS（带日期）</option>
+            </select>
+          </div>
+        </div>
+        <input id="sys-log-tz-custom" class="inp log mt-2.5 hidden" placeholder="例如 Asia/Bangkok（需系统装了 tzdata）">
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button class="btn px-4 py-2 text-sm" onclick="saveLogTime()">保存日志时区</button>
+          <span id="sys-log-preview" class="text-xs text-[#7d738e]"></span>
         </div>
       </div>
     </div>
@@ -1780,6 +1816,11 @@ try{
 /* ---------- Project ID auto-extract ---------- */
 $('project-input').addEventListener('input',function(e){ var v=e.target.value.trim(); var m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
 $('image_aspect_ratio').addEventListener('change', function(e){ curAR=e.target.value; });
+$('sys-log-tz').addEventListener('change', function(e){
+  var isCustom = (e.target.value === 'custom');
+  $('sys-log-tz-custom').classList.toggle('hidden', !isCustom);
+  if(isCustom) $('sys-log-tz-custom').focus();
+});
 
 /* ---------- 系统设置（口令 / 代理 / 模型源 / 持久化 / 首次启动向导） ---------- */
 var SYS = {}, WIZ_STEP = 1;
@@ -1814,6 +1855,16 @@ async function loadSystem(){
     rp.textContent = s.ready ? '✅ 通道就绪' : '⚠ 还没有可用凭证';
     rp.className = 'pill ' + (s.ready ? 'pill-mint' : 'pill-apricot');
     $('first-run-card').classList.toggle('hidden', !s.first_run);
+    var tzVal = s.log_timezone || 'Asia/Shanghai';
+    var tzSel = $('sys-log-tz');
+    var tzKnown = Array.prototype.some.call(tzSel.options, function(o){ return o.value === tzVal; });
+    tzSel.value = tzKnown ? tzVal : 'custom';
+    $('sys-log-tz-custom').value = tzKnown ? '' : tzVal;
+    $('sys-log-tz-custom').classList.toggle('hidden', tzKnown);
+    $('sys-log-fmt').value = (s.log_time_format === 'datetime') ? 'datetime' : 'time';
+    $('sys-tz-pill').textContent = s.log_timezone_label || tzVal;
+    $('sys-log-preview').textContent = '当前示例：[' + (s.log_time_preview || '') + ']';
+    if($('log-tz-label')) $('log-tz-label').textContent = ' · ' + (s.log_timezone_label || '');
     $('wiz-key-tip').innerHTML = s.api_key_is_default
       ? '当前口令仍是默认的 <b>123456</b>，谁拿到它就能登录控制台并读取你的 Google 会话 Cookie，务必换掉。'
       : ('当前口令已自定义（' + s.api_key_masked + '）。想换一个就填新的，留空则保持不变。');
@@ -1904,6 +1955,19 @@ async function saveModelsSource(){
 }
 function resetModelsSource(){ $('sys-models-url').value=''; saveModelsSource(); }
 function downloadState(){ window.open('/api/system/state-backup','_blank'); }
+async function saveLogTime(){
+  var sel = $('sys-log-tz').value;
+  var tz = (sel === 'custom') ? ($('sys-log-tz-custom').value.trim() || 'Asia/Shanghai') : sel;
+  var fmt = $('sys-log-fmt').value;
+  try{
+    var r = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({log_timezone:tz, log_time_format:fmt})});
+    if(!r.ok){ toast('❌ 保存失败'); return; }
+    GLOBAL_SETTINGS = await r.json();
+    await loadSystem();
+    toast('✅ 日志时区已保存，新日志立即生效');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
 
 function renderWizard(){
   [1,2,3].forEach(function(i){ var el=$('wiz-'+i); if(el) el.classList.toggle('hidden', i!==WIZ_STEP); });
@@ -2293,6 +2357,7 @@ async def get_system_info(_auth: bool = Depends(require_auth)):
         "state_file_exists": exists,
         "state_file_size": os.path.getsize(state_path) if exists else 0,
         "ready": bool(enabled or cookie_configured),
+        **describe_log_timezone(),
     })
 
 

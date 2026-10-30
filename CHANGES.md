@@ -1,3 +1,16 @@
+## 2026-10-30 运行日志时区：默认北京时间（容器 UTC 也不影响）
+
+- 症状：Docker 容器默认 `TZ=UTC`，运行日志 `[HH:MM:SS]` 比北京时间慢 8 小时。
+- `logger.format_timestamp()` 改为**按控制台设置**格式化时间戳，不再依赖容器本地时区：
+  - 默认 `log_timezone="Asia/Shanghai"`，优先走 `zoneinfo`；**没装 tzdata 的 slim 镜像自动回退固定 `UTC+8`**，裸镜像也能出北京时间；
+  - 支持 `Asia/Hong_Kong` / `Asia/Taipei` / `Asia/Singapore` / `Asia/Tokyo` / `UTC` / `local`（跟随服务器）以及任意 IANA 名（装了 tzdata 时）；
+  - `log_time_format` 可选 `time`（`HH:MM:SS`）或 `datetime`（`MM-DD HH:MM:SS`，跨天不再混淆）。
+- 控制台「系统设置」新增「运行日志时区与格式」卡片：下拉选时区 / 格式、实时示例预览、保存即生效（新日志立即用新时区，历史日志保持原样）；「运行日志」标题栏右侧显示当前生效时区。
+- `GET /api/system` 增加 `log_timezone` / `log_timezone_label` / `log_time_preview` 字段。
+- 测试：`tests/smoke_console_system.py` 增加 7 项时区断言（默认北京时间、UTC 切换、带日期格式、恢复），共 36 项全过。
+
+---
+
 ## 2026-10-29 流式收尾保护 + Gemini 4.x 工具调用加固（修 JSONDecodeError / 工具 Schema 400）
 
 ### 1. 流式收尾保护：不再让客户端拿到「断头流」
